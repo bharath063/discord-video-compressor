@@ -223,7 +223,7 @@ def get_app_version() -> str:
         # main.py also works alone during development. Releases include VERSION.
         if getattr(sys, "frozen", False):
             raise RuntimeError("The app version is missing. Reinstall the app.")
-        value = "0.0.1"
+        value = "0.0.2"
     version_parts(value)
     return value.removeprefix("v")
 
@@ -1313,13 +1313,7 @@ class DropArea(QFrame):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(14)
-        heading = QHBoxLayout()
-        heading.addWidget(ui_label("INPUT VIDEO", "eyebrow"))
-        heading.addStretch(1)
-        self.button = QPushButton("Choose video")
-        self.button.clicked.connect(self.select_file)
-        heading.addWidget(self.button)
-        layout.addLayout(heading)
+        layout.addWidget(ui_label("INPUT VIDEO", "eyebrow"))
         self.thumbnail = ClipPreview()
         self.thumbnail.clicked.connect(self.select_file)
         layout.addWidget(self.thumbnail, stretch=1)
@@ -1376,7 +1370,6 @@ class DropArea(QFrame):
         self.thumbnail.set_image(QPixmap())
         for value in self.metric_values.values():
             value.setText("—")
-        self.button.setText("Change video")
 
     def set_preview(self, data: bytes):
         pixmap = QPixmap()

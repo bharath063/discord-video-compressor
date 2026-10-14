@@ -826,10 +826,7 @@ class SizeSettingTests(unittest.TestCase):
                 QTest.mouseClick(
                     self.window.drop, main.Qt.MouseButton.LeftButton, pos=QPoint(5, 5)
                 )
-                QTest.mouseClick(
-                    self.window.drop.button, main.Qt.MouseButton.LeftButton
-                )
-                self.assertEqual(picker.call_count, calls + 3)
+                self.assertEqual(picker.call_count, calls + 2)
 
     def test_drop_area_opens_picker_with_keyboard_and_after_thumbnail_load(self):
         self.window.show()

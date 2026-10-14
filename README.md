@@ -22,7 +22,7 @@ app has no certificate signature. Your operating system may block the first laun
 
 ## Use
 
-1. Click **Choose video**, click the video area, or drag a clip into the app.
+1. Click the video area, or drag a clip into the app.
 2. Set **Maximum file size**. Keep 19.5 MB for Discord, or choose a size from 1 to 500 MB.
 3. Select **Compress video** and choose where to save it.
 4. Check the final file size and elapsed time. Select **Show in folder** to find the result.
