@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Original app artwork. SPDX-License-Identifier: GPL-3.0-only -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0.6" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#e6edf0"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0.7" y2="1">
+      <stop offset="0" stop-color="#24333e"/>
+      <stop offset="1" stop-color="#0b1218"/>
+    </linearGradient>
+    <linearGradient id="play" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#b4ffe7"/>
+      <stop offset="1" stop-color="#70e4be"/>
+    </linearGradient>
+  </defs>
+  <rect x="72" y="84" width="880" height="880" rx="202" fill="#111820" opacity="0.10"/>
+  <rect x="64" y="64" width="896" height="896" rx="202" fill="url(#tile)" stroke="#d7e1e6" stroke-width="4"/>
+  <rect x="176" y="272" width="672" height="480" rx="76" fill="#354953" opacity="0.16" transform="translate(0 16)"/>
+  <rect x="176" y="272" width="672" height="480" rx="76" fill="url(#screen)"/>
+  <path d="M332 348 H264 V416 M760 608 V676 H692" fill="none" stroke="#89f3d1" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M450 388 Q436 380 436 400 V624 Q436 644 453 634 L647 523 Q668 512 647 501 Z" fill="url(#play)"/>
+</svg>
