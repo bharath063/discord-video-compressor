@@ -1430,7 +1430,7 @@ class MainWindow(QMainWindow):
         self.updates.failed.connect(self.show_update_error)
         self.updates.busy_changed.connect(self.update_check_state)
         self.resize(1060, 740)
-        self.setMinimumSize(900, 680)
+        self.setMinimumSize(900, 720)
         self.settings = (
             settings
             if settings is not None
