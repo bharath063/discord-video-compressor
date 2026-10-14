@@ -6,7 +6,7 @@ on:
       version:
         description: 'Version for a test build; does not publish a release'
         required: true
-        default: 'v0.0.3-rc.1'
+        default: 'v0.0.3-rc.2'
         type: string
   push:
     tags:

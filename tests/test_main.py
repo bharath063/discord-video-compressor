@@ -284,6 +284,23 @@ class ProbeTests(unittest.TestCase):
 
 
 class PathTests(unittest.TestCase):
+    def test_nvidia_cuda_frames_stay_on_the_gpu(self):
+        command = main.encoding_commands(
+            "ffmpeg",
+            Path("input.mp4"),
+            Path("output.mp4"),
+            main.MediaInfo(30, False, 0, 1920, 1080),
+            main.Hardware("hevc_nvenc", "NVIDIA"),
+            500_000,
+            gpu_decode=True,
+        )[0]
+        self.assertLess(command.index("-hwaccel"), command.index("-i"))
+        self.assertEqual(command[command.index("-hwaccel") + 1], "cuda")
+        self.assertEqual(command[command.index("-hwaccel_output_format") + 1], "cuda")
+        self.assertIn("scale_cuda", command[command.index("-vf") + 1])
+        self.assertEqual(command[command.index("-c:v") + 1], "hevc_nvenc")
+        self.assertNotIn("-pix_fmt", command)
+
     def test_bundle_takes_priority_and_does_not_use_path_when_incomplete(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -414,8 +431,10 @@ class DetectionTests(unittest.TestCase):
 
     def test_broken_driver_uses_software(self):
         worker = main.DetectionWorker()
-        results = []
+        results, errors, notices = [], [], []
         worker.detected.connect(results.append)
+        worker.diagnostic.connect(errors.append)
+        worker.notice.connect(notices.append)
         listing = " V....D hevc_nvenc NVIDIA\n V....D libx265 HEVC"
         with (
             patch("main.get_ffmpeg_path", return_value="ffmpeg"),
@@ -431,9 +450,266 @@ class DetectionTests(unittest.TestCase):
         ):
             worker.run()
         self.assertEqual(results, [main.SOFTWARE])
+        self.assertIn("Driver unavailable", errors[0])
+        self.assertIn("Using CPU", notices[0])
+
+
+class FileAccessTests(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        root = Path(self.folder.name).resolve()
+        self.source, self.output = root / "input with spaces.mp4", root / "output.mp4"
+        self.source.write_bytes(b"original video")
+        self.worker = main.CompressionWorker(
+            self.source, self.output, main.Hardware("hevc_nvenc", "NVIDIA")
+        )
+        self.info = main.MediaInfo(30, False, 0, 640, 360)
+
+    def fake_tool(self, command, **kwargs):
+        if "lavfi" in command:
+            Path(command[-1]).write_bytes(b"one test frame")
+        return ""
+
+    def test_app_cannot_read_source_stops_before_ffprobe(self):
+        original = Path.open
+
+        def open_file(path, mode="r", *args, **kwargs):
+            if path == self.source and mode == "rb":
+                raise PermissionError(13, "Permission denied", str(path))
+            return original(path, mode, *args, **kwargs)
+
+        with (
+            patch.object(Path, "open", open_file),
+            patch.object(self.worker, "probe") as probe,
+            self.assertRaises(main.FileOperationError) as caught,
+        ):
+            self.worker.read_clip(self.source, "ffprobe.exe")
+        probe.assert_not_called()
+        self.assertEqual(caught.exception.program, sys.executable)
+        self.assertEqual(caught.exception.path, self.source)
+        self.assertTrue(caught.exception.denied)
+
+    def test_ffprobe_has_its_own_read_permission(self):
+        with (
+            patch.object(
+                self.worker,
+                "probe",
+                side_effect=main.ProcessError(f"{self.source}: Permission denied"),
+            ),
+            self.assertRaises(main.FileOperationError) as caught,
+        ):
+            self.worker.read_clip(self.source, "ffprobe.exe")
+        self.assertEqual(caught.exception.program, "ffprobe.exe")
+        self.assertEqual(caught.exception.operation, "read the video information")
+        self.assertTrue(caught.exception.denied)
+
+    def test_missing_file_is_not_a_permission_error(self):
+        missing = Path(self.folder.name) / "missing.mp4"
+        with self.assertRaises(main.FileOperationError) as caught:
+            self.worker.read_clip(missing, "ffprobe.exe")
+        self.assertFalse(caught.exception.denied)
+        self.assertIn("missing.mp4", str(caught.exception))
+
+    def test_ffmpeg_cannot_read_source_stops_before_writing(self):
+        changes = []
+        self.worker.hardware_changed.connect(changes.append)
+        with (
+            patch("main.get_ffmpeg_path", side_effect=lambda name: name + ".exe"),
+            patch.object(self.worker, "probe", return_value=self.info),
+            patch.object(
+                self.worker,
+                "run_process",
+                side_effect=main.ProcessError(
+                    "Error opening input files: Permission denied"
+                ),
+            ) as process,
+            self.assertRaises(main.FileOperationError) as caught,
+        ):
+            self.worker.compress()
+        self.assertEqual(process.call_count, 1)
+        self.assertEqual(caught.exception.program, "ffmpeg.exe")
+        self.assertEqual(caught.exception.path, self.source)
+        self.assertEqual(changes, [])
+        self.assertEqual(
+            [p.name for p in Path(self.folder.name).iterdir()], [self.source.name]
+        )
+
+    def test_app_write_block_is_distinct_from_ffmpeg_write_block(self):
+        with (
+            patch("main.get_ffmpeg_path", return_value="ffmpeg.exe"),
+            patch.object(self.worker, "probe", return_value=self.info),
+            patch.object(self.worker, "run_process", return_value="") as process,
+            patch(
+                "main.tempfile.TemporaryFile",
+                side_effect=PermissionError(13, "Permission denied"),
+            ) as write,
+            self.assertRaises(main.FileOperationError) as caught,
+        ):
+            self.worker.compress()
+        self.assertEqual(process.call_count, 1)  # FFmpeg input read only.
+        self.assertEqual(caught.exception.program, sys.executable)
+        self.assertEqual(caught.exception.operation, "write to the output folder")
+        self.assertEqual(caught.exception.path, self.output.parent)
+        self.assertEqual(write.call_args.kwargs["dir"], self.output.parent)
+        self.assertTrue(caught.exception.denied)
+        self.assertFalse(self.output.exists())
+
+    def test_ffmpeg_write_denial_stops_before_gpu_encoding(self):
+        def run_tool(command, **kwargs):
+            if "lavfi" in command:
+                self.assertEqual(command[command.index("-c:v") + 1], "mpeg4")
+                raise main.ProcessError("Error opening output file: Permission denied")
+            return ""
+
+        changes, statuses = [], []
+        self.worker.hardware_changed.connect(changes.append)
+        self.worker.status.connect(statuses.append)
+        with (
+            patch("main.get_ffmpeg_path", side_effect=lambda name: name + ".exe"),
+            patch.object(self.worker, "probe", return_value=self.info),
+            patch.object(self.worker, "run_process", side_effect=run_tool) as process,
+            self.assertRaises(main.FileOperationError) as caught,
+        ):
+            self.worker.compress()
+        self.assertEqual(process.call_count, 2)
+        self.assertEqual(caught.exception.program, "ffmpeg.exe")
+        self.assertEqual(caught.exception.operation, "write to the output folder")
+        self.assertTrue(caught.exception.denied)
+        self.assertEqual(changes, [])
+        self.assertEqual(statuses, ["Checking file access…"])
+        self.assertEqual(self.source.read_bytes(), b"original video")
+        self.assertEqual(
+            [p.name for p in Path(self.folder.name).iterdir()], [self.source.name]
+        )
+
+    def test_ffprobe_must_read_output_folder_too(self):
+        def run_tool(command, **kwargs):
+            if command[0] == "ffprobe.exe":
+                raise main.ProcessError("Permission denied")
+            return self.fake_tool(command, **kwargs)
+
+        with (
+            patch("main.get_ffmpeg_path", side_effect=lambda name: name + ".exe"),
+            patch.object(self.worker, "probe", return_value=self.info),
+            patch.object(self.worker, "run_process", side_effect=run_tool),
+            self.assertRaises(main.FileOperationError) as caught,
+        ):
+            self.worker.compress()
+        self.assertEqual(caught.exception.program, "ffprobe.exe")
+        self.assertEqual(caught.exception.operation, "read from the output folder")
+        self.assertTrue(caught.exception.denied)
+        self.assertFalse(self.output.exists())
+
+    def test_successful_checks_leave_no_dummy_files(self):
+        workdir = Path(self.folder.name) / "work"
+        workdir.mkdir()
+        with patch.object(
+            self.worker, "run_process", side_effect=self.fake_tool
+        ) as process:
+            self.worker.check_file_access(
+                "ffmpeg.exe", "ffprobe.exe", workdir, self.info
+            )
+        self.assertEqual(list(workdir.iterdir()), [])
+        self.assertEqual(process.call_count, 3)
+        self.assertEqual(self.source.read_bytes(), b"original video")
+        self.assertFalse(self.output.exists())
+
+    def test_cancelled_access_check_leaves_no_test_file(self):
+        def cancel_read(command, **kwargs):
+            self.worker.cancel()
+            raise main.Cancelled()
+
+        with (
+            patch("main.get_ffmpeg_path", return_value="ffmpeg"),
+            patch.object(self.worker, "probe", return_value=self.info),
+            patch.object(self.worker, "run_process", side_effect=cancel_read),
+            self.assertRaises(main.Cancelled),
+        ):
+            self.worker.compress()
+        self.assertEqual(
+            [p.name for p in Path(self.folder.name).iterdir()], [self.source.name]
+        )
 
 
 class OutputTests(unittest.TestCase):
+    def setUp(self):
+        # Access checks have their own tests below. These cases exercise the
+        # size and publication rules with a mocked encoder, not a real video.
+        check = patch.object(main.CompressionWorker, "check_file_access")
+        check.start()
+        self.addCleanup(check.stop)
+
+    def test_cpu_decode_retry_keeps_nvidia_encoding(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source, output = Path(folder) / "input.mp4", Path(folder) / "output.mp4"
+            source.write_bytes(b"original")
+            worker = main.CompressionWorker(
+                source, output, main.Hardware("hevc_nvenc", "NVIDIA")
+            )
+            commands, changes, notices = [], [], []
+            worker.hardware_changed.connect(changes.append)
+            worker.notice.connect(notices.append)
+
+            def run_tool(command, **kwargs):
+                commands.append(command)
+                if "-hwaccel" in command:
+                    raise main.ProcessError("GPU decoder does not support this format")
+                Path(command[-1]).write_bytes(b"encoded with NVENC")
+                return ""
+
+            with (
+                patch("main.get_ffmpeg_path", return_value="ffmpeg"),
+                patch.object(
+                    worker, "probe", return_value=main.MediaInfo(30, False, 0, 640, 360)
+                ),
+                patch.object(worker, "run_process", side_effect=run_tool),
+            ):
+                worker.compress()
+            self.assertEqual(
+                [c[c.index("-c:v") + 1] for c in commands], ["hevc_nvenc"] * 2
+            )
+            self.assertNotIn("-hwaccel", commands[1])
+            self.assertEqual(changes, [])
+            self.assertIn("NVIDIA GPU encoding", notices[0])
+            self.assertEqual(output.read_bytes(), b"encoded with NVENC")
+
+    def test_nvidia_encode_failure_keeps_the_driver_error(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source, output = Path(folder) / "input.mp4", Path(folder) / "output.mp4"
+            source.write_bytes(b"original")
+            worker = main.CompressionWorker(
+                source, output, main.Hardware("hevc_nvenc", "NVIDIA")
+            )
+            encoders, errors, changes = [], [], []
+            worker.hardware_changed.connect(changes.append)
+            worker.diagnostic.connect(errors.append)
+
+            def run_tool(command, **kwargs):
+                encoder = command[command.index("-c:v") + 1]
+                encoders.append(encoder)
+                if encoder == "hevc_nvenc":
+                    raise main.ProcessError(
+                        "OpenEncodeSessionEx failed: driver error 10"
+                    )
+                if command[-1] != main.os.devnull:
+                    Path(command[-1]).write_bytes(b"encoded with CPU")
+                return ""
+
+            with (
+                patch("main.get_ffmpeg_path", return_value="ffmpeg"),
+                patch.object(
+                    worker, "probe", return_value=main.MediaInfo(30, False, 0, 640, 360)
+                ),
+                patch.object(worker, "run_process", side_effect=run_tool),
+            ):
+                worker.compress()
+            self.assertEqual(
+                encoders, ["hevc_nvenc", "hevc_nvenc", "libx265", "libx265"]
+            )
+            self.assertEqual(changes, [main.SOFTWARE])
+            self.assertTrue(all("driver error 10" in error for error in errors))
+
     def test_blocked_output_does_not_retry_using_the_cpu(self):
         with tempfile.TemporaryDirectory() as folder:
             source, output = Path(folder) / "input.mp4", Path(folder) / "output.mp4"
@@ -456,7 +732,7 @@ class OutputTests(unittest.TestCase):
                         "ffmpeg.exe exited with code 1: Error opening output file: Permission denied"
                     ),
                 ) as encoder,
-                self.assertRaises(main.ProcessError),
+                self.assertRaises(main.FileOperationError),
             ):
                 worker.compress()
             encoder.assert_called_once()
@@ -782,6 +1058,73 @@ class SizeSettingTests(unittest.TestCase):
         self.assertEqual(
             open_security.call_args.args[0].toString(), main.WINDOWS_SECURITY_URL
         )
+
+    def test_access_error_names_failed_operation_and_preserves_the_cause(self):
+        blocked = Path(self.folder.name) / "Videos"
+        error = main.FileOperationError(
+            "write to the output folder",
+            blocked,
+            "ffmpeg.exe",
+            main.ProcessError("Error opening output file: Permission denied"),
+        )
+        boxes = []
+        with (
+            patch("main.sys.platform", "win32"),
+            patch.object(main.QMessageBox, "exec", lambda box: boxes.append(box) or 0),
+        ):
+            self.window.show_error(error)
+        self.assertEqual(boxes[0].text(), "File access blocked")
+        self.assertIn("ffmpeg.exe could not write", boxes[0].informativeText())
+        self.assertIn(str(blocked), boxes[0].informativeText())
+        self.assertIn("Permission denied", boxes[0].informativeText())
+        self.assertNotIn("larger file size", boxes[0].informativeText())
+
+    def test_non_access_encoder_error_is_not_reported_as_defender(self):
+        boxes = []
+        self.window.worker = main.CompressionWorker(
+            Path(self.folder.name) / "input.mp4",
+            Path(self.folder.name) / "output.mp4",
+            main.SOFTWARE,
+        )
+        with (
+            patch("main.sys.platform", "win32"),
+            patch.object(main.QMessageBox, "exec", lambda box: boxes.append(box) or 0),
+        ):
+            self.window.show_error(
+                main.ProcessError("Error writing packet: encoder access is denied")
+            )
+        self.assertEqual(boxes[0].text(), "Compression failed")
+        self.assertIn("encoder access is denied", boxes[0].informativeText())
+        self.assertFalse(
+            any(b.text() == "Open Windows Security" for b in boxes[0].buttons())
+        )
+        self.window.worker = None
+
+    def test_why_cpu_shows_and_copies_the_real_gpu_error(self):
+        error = "hevc_nvenc:\nOpenEncodeSessionEx failed: error 10"
+        self.window.set_gpu_diagnostic(error)
+        self.assertFalse(self.window.encoding_help_button.isHidden())
+        boxes = []
+
+        def copy_error(box):
+            boxes.append(box)
+            box._selected_for_test = next(
+                b for b in box.buttons() if b.text() == "Copy error"
+            )
+            return 0
+
+        with (
+            patch.object(main.QMessageBox, "exec", copy_error),
+            patch.object(
+                main.QMessageBox, "clickedButton", lambda box: box._selected_for_test
+            ),
+        ):
+            self.window.encoding_help_button.click()
+        self.assertIn("error 10", boxes[0].informativeText())
+        self.assertIn(error, self.app.clipboard().text())
+        self.assertIn(self.window.version, self.app.clipboard().text())
+        self.window.set_hardware(main.Hardware("hevc_nvenc", "NVIDIA"))
+        self.assertTrue(self.window.encoding_help_button.isHidden())
 
     def test_blocked_initial_file_read_does_not_escape_the_gui_slot(self):
         boxes = []
@@ -1214,6 +1557,13 @@ class WindowsProcessTests(unittest.TestCase):
         self.assertTrue(main.is_file_access_error("[WinError 5] Zugriff verweigert"))
         self.assertTrue(
             main.is_file_access_error("Error opening input files: Permission denied")
+        )
+        self.assertFalse(
+            main.is_file_access_error(
+                "[hevc_nvenc] OpenEncodeSessionEx failed: access is denied\n"
+                "Error while opening encoder - maybe incorrect parameters\n"
+                "Error opening output files: Permission denied"
+            )
         )
 
 

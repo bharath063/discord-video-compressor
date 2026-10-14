@@ -42,8 +42,11 @@ allowed app → Recently blocked apps**. Allow the program named in the notice:
 Keep the app folder in one location so these approvals stay valid. You can also
 choose another input or output folder. [Microsoft's instructions](https://support.microsoft.com/en-us/windows/security/threat-malware-protection/virus-and-threat-protection-in-the-windows-security-app).
 
-During compression, the progress text shows **NVIDIA GPU**, **AMD GPU**, **Intel GPU**,
-or **CPU**. In Task Manager, check the GPU's **Video Encode** graph.
+The app checks file access before compression. An access error shows the program
+and folder that failed. Select **Copy error** if you need to report it.
+
+The progress text shows the GPU or CPU used for encoding. If GPU encoding fails,
+select **Why CPU?** to see the error. In Task Manager, check **Video Encode**.
 
 [Report a problem](https://github.com/bharath063/discord-video-compressor/issues)
 · [GPL-3.0 license](LICENSE)
