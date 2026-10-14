@@ -62,8 +62,9 @@ common = dict(
     icon=str(icon_files["app.ico"]) if sys.platform == "win32" else None,
 )
 
-if sys.platform == "darwin":
-    # Use an onedir .app so helper executables remain inside the signed bundle.
+if sys.platform in {"darwin", "win32"}:
+    # Keep Windows helpers at fixed paths for Controlled folder access approvals.
+    # macOS also needs a folder payload for its app bundle.
     executable = EXE(
         pyz,
         analysis.scripts,
@@ -81,18 +82,19 @@ if sys.platform == "darwin":
         upx=False,
         name="DiscordVideoCompressor",
     )
-    app = BUNDLE(
-        collection,
-        name="DiscordVideoCompressor.app",
-        icon=str(icon_files["app.icns"]),
-        bundle_identifier="io.github.discord-video-compressor",
-        version=bundle_version,
-        info_plist={
-            "CFBundleName": "Discord Video Compressor",
-            "CFBundleDisplayName": "Discord Video Compressor",
-            "NSHighResolutionCapable": True,
-        },
-    )
+    if sys.platform == "darwin":
+        app = BUNDLE(
+            collection,
+            name="DiscordVideoCompressor.app",
+            icon=str(icon_files["app.icns"]),
+            bundle_identifier="io.github.discord-video-compressor",
+            version=bundle_version,
+            info_plist={
+                "CFBundleName": "Discord Video Compressor",
+                "CFBundleDisplayName": "Discord Video Compressor",
+                "NSHighResolutionCapable": True,
+            },
+        )
 else:
     # The onefile payload includes both tools and Qt's platform plugins.
     executable = EXE(

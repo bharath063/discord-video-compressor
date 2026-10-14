@@ -14,7 +14,7 @@ Download the package for your computer and extract it.
 | Platform | Open |
 | --- | --- |
 | macOS, Apple Silicon | Move `DiscordVideoCompressor.app` to Applications, then open it. |
-| Windows, x64 | Open `DiscordVideoCompressor.exe`. |
+| Windows, x64 | Keep the extracted folder together and open `DiscordVideoCompressor.exe`. |
 | Linux, x64 | Run `DiscordVideoCompressor`. Qt system libraries are required. |
 
 Python and FFmpeg are included. The macOS app is not notarized, and the Windows
@@ -31,6 +31,19 @@ Use **Cancel** to stop compression. The **Light / Dark** switch changes the them
 Use **About** to see the app version. Use **Check for updates** to find a newer release.
 
 The output is an MP4 file. HEVC playback support depends on your device.
+
+## Windows file access
+
+If Windows Security blocks the app, open **Virus & threat protection → Manage
+ransomware protection → Allow an app through Controlled folder access → Add an
+allowed app → Recently blocked apps**. Allow the program named in the notice:
+`DiscordVideoCompressor.exe`, `ffmpeg.exe`, or `ffprobe.exe`. Restart the app and retry.
+
+Keep the app folder in one location so these approvals stay valid. You can also
+choose another input or output folder. [Microsoft's instructions](https://support.microsoft.com/en-us/windows/security/threat-malware-protection/virus-and-threat-protection-in-the-windows-security-app).
+
+During compression, the progress text shows **NVIDIA GPU**, **AMD GPU**, **Intel GPU**,
+or **CPU**. In Task Manager, check the GPU's **Video Encode** graph.
 
 [Report a problem](https://github.com/bharath063/discord-video-compressor/issues)
 · [GPL-3.0 license](LICENSE)

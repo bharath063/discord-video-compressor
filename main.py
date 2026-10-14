@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from contextlib import contextmanager
+import ctypes
 from dataclasses import dataclass
 import json
 import math
@@ -79,6 +81,19 @@ UPDATE_API_URL = (
     "https://api.github.com/repos/bharath063/discord-video-compressor/releases/latest"
 )
 AFFILIATION_NOTICE = "This app is not affiliated with Discord."
+WINDOWS_SECURITY_URL = "windowsdefender://allowappthroughfolder"
+WINDOWS_ACCESS_HELP = (
+    "Windows did not allow access to this file or folder.\n\n"
+    "If Windows Security shows a Controlled folder access notice:\n"
+    "1. Open Windows Security > Virus & threat protection.\n"
+    "2. Select Manage ransomware protection.\n"
+    "3. Select Allow an app through Controlled folder access.\n"
+    "4. Select Add an allowed app > Recently blocked apps.\n"
+    "5. Allow the program named in the blocked access notice. It may be "
+    "DiscordVideoCompressor.exe, ffmpeg.exe, or ffprobe.exe.\n\n"
+    "Restart the app, then try again. You can also choose another folder."
+)
+_DLL_DIRECTORY_LOCK = threading.Lock()
 UPDATE_TIMEOUT_MS = 15_000
 MAX_UPDATE_BYTES = 256 * 1024
 DEFAULT_TARGET_MB = 19.5
@@ -192,6 +207,34 @@ class Cancelled(Exception):
 
 class ProcessError(RuntimeError):
     """A child process did not complete."""
+
+
+def is_file_access_error(error: Exception | str) -> bool:
+    text = str(error).casefold()
+    if isinstance(error, PermissionError) or re.search(
+        r"\[(?:winerror 5|errno (?:1|13))\]", text
+    ):
+        return True
+    denied = "permission denied" in text or "access is denied" in text
+    return denied and any(
+        marker in text
+        for marker in (
+            "opening input",
+            "opening output",
+            "open file",
+            "writing",
+            "write header",
+        )
+    )
+
+
+def encoding_device(hardware: Hardware) -> str:
+    return {
+        "hevc_nvenc": "NVIDIA GPU",
+        "hevc_amf": "AMD GPU",
+        "hevc_qsv": "Intel GPU",
+        "hevc_videotoolbox": "Apple GPU",
+    }.get(hardware.encoder, "CPU")
 
 
 def version_parts(value: str) -> tuple[tuple[int, int, int], bool]:
@@ -427,6 +470,26 @@ def process_options() -> dict:
     return options
 
 
+@contextmanager
+def system_dll_directory():
+    """Let Windows children load system GPU drivers, then restore Qt's path."""
+    root = getattr(sys, "_MEIPASS", None)
+    if sys.platform != "win32" or not getattr(sys, "frozen", False) or not root:
+        yield
+        return
+    with _DLL_DIRECTORY_LOCK:
+        setter = ctypes.WinDLL("kernel32", use_last_error=True).SetDllDirectoryW
+        setter.argtypes = [ctypes.c_wchar_p]
+        setter.restype = ctypes.c_int
+        if not setter(None):
+            raise ctypes.WinError()
+        try:
+            yield
+        finally:
+            if not setter(str(root)):
+                raise ctypes.WinError()
+
+
 def output_limit_bytes(target_mb: float) -> int:
     if not math.isfinite(target_mb) or not MIN_TARGET_MB <= target_mb <= MAX_TARGET_MB:
         raise ValueError("Choose a file size from 1 to 500 MB.")
@@ -618,19 +681,31 @@ class ProcessThread(QThread):
         self.check_cancelled()
         with self._lock:
             self.check_cancelled()
-            proc = subprocess.Popen(
-                args,
-                cwd=cwd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                **process_options(),
-            )
-            self._process = proc
+            proc = None
+            try:
+                with system_dll_directory():
+                    proc = subprocess.Popen(
+                        args,
+                        cwd=cwd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        stdin=subprocess.DEVNULL,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        bufsize=1,
+                        **process_options(),
+                    )
+                    self._process = proc
+            except BaseException:
+                if proc is not None:
+                    if proc.poll() is None:
+                        proc.kill()
+                    proc.wait()
+                    if proc.stdout:
+                        proc.stdout.close()
+                self._process = None
+                raise
         timer = None
         timed_out = threading.Event()
 
@@ -715,37 +790,16 @@ def hardware_candidates(worker: ProcessThread) -> list[Hardware]:
             else []
         )
 
-    vendors: set[str] = set()
     if system == "Windows":
-        powershell = shutil.which("powershell.exe")
-        if powershell:
-            try:
-                # This is fixed code. No filename or user text enters PowerShell.
-                names = worker.run_process(
-                    [
-                        powershell,
-                        "-NoProfile",
-                        "-NonInteractive",
-                        "-Command",
-                        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
-                        "Get-CimInstance Win32_VideoController | "
-                        "Select-Object -ExpandProperty Name",
-                    ],
-                    timeout=15,
-                ).lower()
-                if "nvidia" in names:
-                    vendors.add("nvidia")
-                if (
-                    "amd" in names
-                    or "radeon" in names
-                    or "advanced micro devices" in names
-                ):
-                    vendors.add("amd")
-                if "intel" in names:
-                    vendors.add("intel")
-            except (OSError, ProcessError) as exc:
-                worker.log.emit(f"GPU inventory could not run: {exc}")
-    elif system == "Linux":
+        # The driver encode checks below identify usable GPUs directly. This
+        # works even when PowerShell, WMI, or nvidia-smi are unavailable.
+        return [
+            Hardware("hevc_nvenc", "NVIDIA GPU via NVENC"),
+            Hardware("hevc_amf", "AMD GPU via AMF", BUFFERED_TARGET_MB),
+            Hardware("hevc_qsv", "Intel GPU via Quick Sync", BUFFERED_TARGET_MB),
+        ]
+    vendors: set[str] = set()
+    if system == "Linux":
         vendor_ids = {"0x10de": "nvidia", "0x1002": "amd", "0x8086": "intel"}
         for device in Path("/sys/bus/pci/devices").glob("*"):
             try:
@@ -779,6 +833,7 @@ def hardware_candidates(worker: ProcessThread) -> list[Hardware]:
 
 class DetectionWorker(ProcessThread):
     detected = pyqtSignal(object)
+    notice = pyqtSignal(str)
 
     def run(self):
         try:
@@ -806,7 +861,7 @@ class DetectionWorker(ProcessThread):
                             "-f",
                             "lavfi",
                             "-i",
-                            "color=size=128x128:rate=30",
+                            "color=size=1280x720:rate=30",
                             "-frames:v",
                             "4",
                         ]
@@ -817,7 +872,20 @@ class DetectionWorker(ProcessThread):
                     self.detected.emit(candidate)
                     return
                 except (OSError, ProcessError) as exc:
+                    if is_file_access_error(exc):
+                        raise
                     self.log.emit(f"{candidate.description} is not available: {exc}")
+                    if candidate.encoder == "hevc_nvenc" and any(
+                        text in str(exc).casefold()
+                        for text in (
+                            "required nvenc api",
+                            "minimum required nvidia driver",
+                        )
+                    ):
+                        self.notice.emit(
+                            "NVIDIA video encoding needs a newer driver. "
+                            "Update your NVIDIA driver, then restart the app."
+                        )
             if "libx265" not in available:
                 raise RuntimeError(
                     "FFmpeg has no working hardware encoder and no libx265 encoder."
@@ -872,6 +940,8 @@ class ProbeWorker(ProcessThread):
                     if preview.is_file():
                         self.preview.emit(preview.read_bytes())
             except (OSError, ProcessError) as exc:
+                if is_file_access_error(exc):
+                    raise
                 self.log.emit(f"Preview unavailable: {exc}")
             self.inspected.emit(info)
         except Cancelled:
@@ -920,7 +990,9 @@ class CompressionWorker(ProcessThread):
             for attempt in range(1, MAX_ATTEMPTS + 1):
                 self.check_cancelled()
                 self.status.emit(
-                    "Compressing clip…" if attempt == 1 else "Adjusting file size…"
+                    f"Compressing with {encoding_device(hardware)}…"
+                    if attempt == 1
+                    else f"Adjusting file size with {encoding_device(hardware)}…"
                 )
                 self.log.emit(
                     f"Attempt {attempt} of {MAX_ATTEMPTS}; selected limit {self.target_mb:g} MB"
@@ -967,8 +1039,8 @@ class CompressionWorker(ProcessThread):
                             self.log.emit(line)
 
                         self.run_process(command, cwd=workdir, on_line=receive_line)
-                except ProcessError:
-                    if hardware.encoder == "libx265":
+                except ProcessError as exc:
+                    if hardware.encoder == "libx265" or is_file_access_error(exc):
                         raise
                     self.log.emit(
                         "Hardware encoding failed. Retrying with software encoding."
@@ -1439,6 +1511,7 @@ class MainWindow(QMainWindow):
         self.source: Path | None = None
         self.info: MediaInfo | None = None
         self.hardware: Hardware | None = None
+        self.gpu_notice = ""
         self.output: Path | None = None
         self.worker: ProcessThread | None = None
         self._closing = False
@@ -1626,6 +1699,7 @@ class MainWindow(QMainWindow):
         self.update_controls()
         worker = DetectionWorker(self)
         worker.detected.connect(self.set_hardware)
+        worker.notice.connect(self.set_gpu_notice)
         self.launch(worker)
 
     def show_about(self):
@@ -1747,11 +1821,14 @@ class MainWindow(QMainWindow):
             if not isinstance(self.worker, CompressionWorker):
                 self.status_label.setText("Ready to compress")
                 self.status_hint.setText(
-                    f"Save the full clip under {self.target_size.value():g} MB."
+                    self.gpu_notice
+                    or f"Save the full clip under {self.target_size.value():g} MB."
                 )
         elif self.worker is None:
             self.status_label.setText("Choose a video to start")
-            self.status_hint.setText("Your original clip stays unchanged.")
+            self.status_hint.setText(
+                self.gpu_notice or "Your original clip stays unchanged."
+            )
 
     def update_controls(self):
         busy = self.worker is not None
@@ -1781,15 +1858,25 @@ class MainWindow(QMainWindow):
 
     def set_hardware(self, hardware: Hardware):
         self.hardware = hardware
+        if hardware.encoder != "libx265":
+            self.gpu_notice = ""
         if not isinstance(self.worker, CompressionWorker):
             self.refresh_ready_state()
+
+    def set_gpu_notice(self, message: str):
+        self.gpu_notice = message
+        self.refresh_ready_state()
 
     def load_video(self, filename: str):
         if self.worker is not None:
             return
-        source = Path(filename).expanduser().resolve()
-        if not source.is_file():
-            self.show_error("Choose a video file from your computer.")
+        try:
+            source = Path(filename).expanduser().resolve()
+            if not source.is_file():
+                self.show_error("Choose a video file from your computer.")
+                return
+        except OSError as exc:
+            self.show_error(str(exc))
             return
         self.source, self.info, self.output = source, None, None
         self._can_fit = False
@@ -1820,11 +1907,17 @@ class MainWindow(QMainWindow):
             or not self._can_fit
         ):
             return
-        default = self.source.with_name(self.source.stem + "-discord.mp4")
-        copy = 2
-        while default.exists():
-            default = self.source.with_name(f"{self.source.stem}-discord-{copy}.mp4")
-            copy += 1
+        try:
+            default = self.source.with_name(self.source.stem + "-discord.mp4")
+            copy = 2
+            while default.exists():
+                default = self.source.with_name(
+                    f"{self.source.stem}-discord-{copy}.mp4"
+                )
+                copy += 1
+        except OSError as exc:
+            self.show_error(str(exc))
+            return
         filename, _ = QFileDialog.getSaveFileName(
             self,
             "Save compressed video",
@@ -1837,9 +1930,13 @@ class MainWindow(QMainWindow):
         output = Path(filename).expanduser()
         if output.suffix.lower() != ".mp4":
             output = output.with_suffix(".mp4")
-        output = output.resolve()
-        if output.exists():
-            self.show_error("A file with that name exists. Choose a new filename.")
+        try:
+            output = output.resolve()
+            if output.exists():
+                self.show_error("A file with that name exists. Choose a new filename.")
+                return
+        except OSError as exc:
+            self.show_error(str(exc))
             return
         self.output = None
         self.progress.setValue(0)
@@ -1893,7 +1990,10 @@ class MainWindow(QMainWindow):
 
     def show_error(self, message: str):
         self.stop_elapsed()
-        if isinstance(self.worker, DetectionWorker):
+        access_blocked = sys.platform == "win32" and is_file_access_error(message)
+        if access_blocked:
+            title, help_text = "File access blocked", WINDOWS_ACCESS_HELP
+        elif isinstance(self.worker, DetectionWorker):
             title, help_text = (
                 "Video tools are unavailable",
                 "Reinstall the app, then try again.",
@@ -1913,14 +2013,27 @@ class MainWindow(QMainWindow):
         else:
             title, help_text = "Check the selected file", message
         self.status_label.setText(title)
-        self.status_hint.setText(help_text)
+        self.status_hint.setText(
+            "Choose another folder, or allow the blocked app in Windows Security."
+            if access_blocked
+            else help_text
+        )
         if not self._closing:
             box = QMessageBox(self)
             box.setWindowTitle(APP_NAME)
             box.setIcon(QMessageBox.Icon.Warning)
+            box.setTextFormat(Qt.TextFormat.PlainText)
             box.setText(title)
             box.setInformativeText(help_text)
+            security = None
+            if access_blocked:
+                security = box.addButton(
+                    "Open Windows Security", QMessageBox.ButtonRole.ActionRole
+                )
+                box.addButton(QMessageBox.StandardButton.Close)
             box.exec()
+            if security is not None and box.clickedButton() is security:
+                QDesktopServices.openUrl(QUrl(WINDOWS_SECURITY_URL))
 
     def job_finished(self):
         self.stop_elapsed()
@@ -1991,6 +2104,12 @@ def self_test() -> int:
         output = folder / "output with spaces.mp4"
         runner = ProcessThread()
         ffmpeg, ffprobe = get_ffmpeg_path("ffmpeg"), get_ffmpeg_path("ffprobe")
+        if sys.platform == "win32" and getattr(sys, "frozen", False):
+            app_folder = Path(sys.executable).resolve().parent
+            for binary in (ffmpeg, ffprobe):
+                assert Path(binary).is_relative_to(app_folder), (
+                    "Windows helper paths must stay in the app folder."
+                )
         runner.run_process(
             [
                 ffmpeg,

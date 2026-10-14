@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import io
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ import threading
 import time
 import unittest
 from unittest.mock import patch
+from unittest.mock import MagicMock
 
 import main
 from PyQt6.QtCore import QPoint
@@ -320,6 +322,59 @@ class PathTests(unittest.TestCase):
 
 
 class DetectionTests(unittest.TestCase):
+    def test_windows_nvenc_is_checked_without_inventory_tools(self):
+        worker = main.DetectionWorker()
+        detected = []
+        worker.detected.connect(detected.append)
+
+        def fake_driver(command, **kwargs):
+            if "-encoders" in command:
+                return " V....D hevc_nvenc NVIDIA\n V....D libx265 HEVC"
+            self.assertEqual(command[command.index("-c:v") + 1], "hevc_nvenc")
+            source = command[command.index("-i") + 1]
+            dimensions = source.split("size=", 1)[1].split(":", 1)[0]
+            width, height = map(int, dimensions.split("x"))
+            if width < 256 or height < 144:
+                raise main.ProcessError("The driver rejects a test frame this small.")
+            return ""
+
+        with (
+            patch("main.platform.system", return_value="Windows"),
+            patch("main.shutil.which", return_value=None) as inventory,
+            patch("main.get_ffmpeg_path", return_value="ffmpeg"),
+            patch.object(worker, "run_process", side_effect=fake_driver),
+        ):
+            worker.run()
+        self.assertEqual([item.encoder for item in detected], ["hevc_nvenc"])
+        inventory.assert_not_called()
+
+    def test_old_nvidia_driver_reports_an_actionable_notice(self):
+        worker = main.DetectionWorker()
+        detected, notices = [], []
+        worker.detected.connect(detected.append)
+        worker.notice.connect(notices.append)
+        with (
+            patch("main.get_ffmpeg_path", return_value="ffmpeg"),
+            patch(
+                "main.hardware_candidates",
+                return_value=[main.Hardware("hevc_nvenc", "NVIDIA")],
+            ),
+            patch.object(
+                worker,
+                "run_process",
+                side_effect=[
+                    " V....D hevc_nvenc NVIDIA\n V....D libx265 HEVC",
+                    main.ProcessError(
+                        "Driver does not support the required nvenc API version."
+                    ),
+                ],
+            ),
+        ):
+            worker.run()
+        self.assertEqual(detected, [main.SOFTWARE])
+        self.assertEqual(len(notices), 1)
+        self.assertIn("Update your NVIDIA driver", notices[0])
+
     def test_apple_silicon_and_intel_mac(self):
         worker = main.ProcessThread()
         with patch("main.platform.system", return_value="Darwin"):
@@ -379,6 +434,37 @@ class DetectionTests(unittest.TestCase):
 
 
 class OutputTests(unittest.TestCase):
+    def test_blocked_output_does_not_retry_using_the_cpu(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source, output = Path(folder) / "input.mp4", Path(folder) / "output.mp4"
+            source.write_bytes(b"input")
+            worker = main.CompressionWorker(
+                source, output, main.Hardware("hevc_nvenc", "NVIDIA")
+            )
+            changes, statuses = [], []
+            worker.hardware_changed.connect(changes.append)
+            worker.status.connect(statuses.append)
+            with (
+                patch("main.get_ffmpeg_path", return_value="ffmpeg"),
+                patch.object(
+                    worker, "probe", return_value=main.MediaInfo(30, False, 0, 640, 360)
+                ),
+                patch.object(
+                    worker,
+                    "run_process",
+                    side_effect=main.ProcessError(
+                        "ffmpeg.exe exited with code 1: Error opening output file: Permission denied"
+                    ),
+                ) as encoder,
+                self.assertRaises(main.ProcessError),
+            ):
+                worker.compress()
+            encoder.assert_called_once()
+            self.assertEqual(changes, [])
+            self.assertIn("Compressing with NVIDIA GPU…", statuses)
+            self.assertFalse(output.exists())
+            self.assertEqual(source.read_bytes(), b"input")
+
     def test_default_can_publish_a_file_larger_than_the_old_limit(self):
         with tempfile.TemporaryDirectory() as folder:
             source, output = Path(folder) / "input.mp4", Path(folder) / "output.mp4"
@@ -667,6 +753,65 @@ class SizeSettingTests(unittest.TestCase):
         self.assertEqual(
             self.window.about_action.menuRole(), main.QAction.MenuRole.AboutRole
         )
+
+    def test_windows_access_error_opens_help_for_the_blocked_app(self):
+        boxes = []
+
+        def choose_security(box):
+            boxes.append(box)
+            box._selected_for_test = next(
+                button
+                for button in box.buttons()
+                if button.text() == "Open Windows Security"
+            )
+            return 0
+
+        with (
+            patch("main.sys.platform", "win32"),
+            patch.object(main.QMessageBox, "exec", choose_security),
+            patch.object(
+                main.QMessageBox, "clickedButton", lambda box: box._selected_for_test
+            ),
+            patch.object(main.QDesktopServices, "openUrl") as open_security,
+        ):
+            self.window.show_error("[WinError 5] Access is denied")
+        self.assertEqual(boxes[0].text(), "File access blocked")
+        self.assertIn("Recently blocked apps", boxes[0].informativeText())
+        self.assertIn("ffmpeg.exe", boxes[0].informativeText())
+        self.assertEqual(boxes[0].textFormat(), main.Qt.TextFormat.PlainText)
+        self.assertEqual(
+            open_security.call_args.args[0].toString(), main.WINDOWS_SECURITY_URL
+        )
+
+    def test_blocked_initial_file_read_does_not_escape_the_gui_slot(self):
+        boxes = []
+        with (
+            patch("main.sys.platform", "win32"),
+            patch.object(
+                Path, "is_file", side_effect=PermissionError(13, "Permission denied")
+            ),
+            patch.object(main.QMessageBox, "exec", lambda box: boxes.append(box) or 0),
+        ):
+            self.window.load_video(str(Path(self.folder.name) / "blocked.mp4"))
+        self.assertEqual(len(boxes), 1)
+        self.assertEqual(boxes[0].text(), "File access blocked")
+        self.assertIsNone(self.window.source)
+
+    def test_blocked_save_path_is_reported_before_encoding(self):
+        self.window.source = Path(self.folder.name) / "clip.mp4"
+        self.window.set_media(main.MediaInfo(30, False, 0, 640, 360))
+        boxes = []
+        with (
+            patch("main.sys.platform", "win32"),
+            patch.object(
+                Path, "exists", side_effect=PermissionError(13, "Permission denied")
+            ),
+            patch.object(main.QMessageBox, "exec", lambda box: boxes.append(box) or 0),
+            patch.object(self.window, "launch") as launch,
+        ):
+            self.window.start_compression()
+        self.assertEqual(boxes[0].text(), "File access blocked")
+        launch.assert_not_called()
 
     def test_mac_app_menu_and_header_buttons_use_the_same_actions(self):
         with (
@@ -986,6 +1131,90 @@ class RevealTests(unittest.TestCase):
         self.assertTrue(errors)
         self.assertEqual(revealed, [])
         run.assert_not_called()
+
+
+class WindowsProcessTests(unittest.TestCase):
+    def test_restore_failure_does_not_leave_a_child_running(self):
+        setter = MagicMock(side_effect=[1, 0])
+        child = MagicMock(stdout=io.StringIO("output\n"))
+        child.poll.return_value = None
+        runner = main.ProcessThread()
+        with (
+            patch("main.sys.platform", "win32"),
+            patch("main.sys.frozen", True, create=True),
+            patch("main.sys._MEIPASS", "C:\\Compressor\\_internal", create=True),
+            patch(
+                "main.ctypes.WinDLL",
+                return_value=MagicMock(SetDllDirectoryW=setter),
+                create=True,
+            ),
+            patch(
+                "main.ctypes.WinError",
+                return_value=OSError("Restore failed"),
+                create=True,
+            ),
+            patch("main.subprocess.CREATE_NO_WINDOW", 0, create=True),
+            patch("main.subprocess.Popen", return_value=child),
+            self.assertRaisesRegex(OSError, "Restore failed"),
+        ):
+            runner.run_process(["ffmpeg.exe"])
+        child.kill.assert_called_once()
+        child.wait.assert_called_once()
+        self.assertTrue(child.stdout.closed)
+        self.assertIsNone(runner._process)
+
+    def test_child_uses_system_dll_paths_and_parent_path_is_restored(self):
+        setter = MagicMock(return_value=1)
+        kernel = MagicMock(SetDllDirectoryW=setter)
+        child = MagicMock(stdout=io.StringIO("output\n"))
+        child.wait.return_value = 0
+        child.poll.return_value = 0
+
+        def spawn(*args, **kwargs):
+            self.assertEqual(setter.call_args.args, (None,))
+            return child
+
+        with (
+            patch("main.sys.platform", "win32"),
+            patch("main.sys.frozen", True, create=True),
+            patch("main.sys._MEIPASS", "C:\\Compressor\\_internal", create=True),
+            patch("main.ctypes.WinDLL", return_value=kernel, create=True),
+            patch("main.subprocess.CREATE_NO_WINDOW", 0, create=True),
+            patch("main.subprocess.Popen", side_effect=spawn),
+        ):
+            self.assertEqual(main.ProcessThread().run_process(["ffmpeg.exe"]), "output")
+        self.assertEqual(
+            [call.args for call in setter.call_args_list],
+            [(None,), ("C:\\Compressor\\_internal",)],
+        )
+
+    def test_parent_dll_path_is_restored_when_launch_fails(self):
+        setter = MagicMock(return_value=1)
+        with (
+            patch("main.sys.platform", "win32"),
+            patch("main.sys.frozen", True, create=True),
+            patch("main.sys._MEIPASS", "C:\\Compressor\\_internal", create=True),
+            patch(
+                "main.ctypes.WinDLL",
+                return_value=MagicMock(SetDllDirectoryW=setter),
+                create=True,
+            ),
+            self.assertRaises(OSError),
+        ):
+            with main.system_dll_directory():
+                raise OSError("Could not start the child.")
+        self.assertEqual(setter.call_args.args, ("C:\\Compressor\\_internal",))
+
+    def test_gpu_driver_errors_are_not_reported_as_folder_blocks(self):
+        self.assertFalse(
+            main.is_file_access_error(
+                "[hevc_nvenc] OpenEncodeSessionEx failed: access is denied"
+            )
+        )
+        self.assertTrue(main.is_file_access_error("[WinError 5] Zugriff verweigert"))
+        self.assertTrue(
+            main.is_file_access_error("Error opening input files: Permission denied")
+        )
 
 
 class ProcessTests(unittest.TestCase):
