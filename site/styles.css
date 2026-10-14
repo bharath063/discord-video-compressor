@@ -89,6 +89,7 @@ code { font-family: inherit; font-size: inherit; color: var(--ink); }
 .site-footer div { display: flex; flex-wrap: wrap; gap: 25px; }
 .site-footer a { text-decoration: none; }
 .site-footer a:hover { color: var(--green); }
+.affiliation-note { padding-bottom: 24px; color: var(--muted); font-size: 12px; }
 
 @media (min-width: 1400px) {
   .hero { gap: 56px; }

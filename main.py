@@ -21,6 +21,7 @@ import threading
 import time
 
 from PyQt6.QtCore import (
+    QObject,
     QPointF,
     QRectF,
     QSettings,
@@ -31,6 +32,7 @@ from PyQt6.QtCore import (
     pyqtSignal,
 )
 from PyQt6.QtGui import (
+    QAction,
     QColor,
     QDesktopServices,
     QDragEnterEvent,
@@ -44,6 +46,12 @@ from PyQt6.QtGui import (
     QPalette,
     QPen,
     QPixmap,
+)
+from PyQt6.QtNetwork import (
+    QNetworkAccessManager,
+    QNetworkReply,
+    QNetworkRequest,
+    QSslSocket,
 )
 from PyQt6.QtWidgets import (
     QApplication,
@@ -64,6 +72,15 @@ from PyQt6.QtWidgets import (
 
 APP_NAME = "Discord Video Compressor"
 APP_ID = "io.github.discord-video-compressor"
+PROJECT_URL = "https://github.com/bharath063/discord-video-compressor"
+WEBSITE_URL = "https://bharath063.github.io/discord-video-compressor/"
+RELEASES_URL = PROJECT_URL + "/releases/latest"
+UPDATE_API_URL = (
+    "https://api.github.com/repos/bharath063/discord-video-compressor/releases/latest"
+)
+AFFILIATION_NOTICE = "This app is not affiliated with Discord."
+UPDATE_TIMEOUT_MS = 15_000
+MAX_UPDATE_BYTES = 256 * 1024
 DEFAULT_TARGET_MB = 19.5
 BUFFERED_TARGET_MB = 18.0
 MIN_TARGET_MB = 1.0
@@ -138,6 +155,7 @@ QPushButton#preset:hover { border-color: $accent; }
 QPushButton#preset[selected="true"] { background: $accent; color: $on_accent;
                                        border-color: $accent; }
 QPushButton:focus { border: 1px solid $accent; }
+QPushButton#headerAction { padding: 8px 12px; }
 QDoubleSpinBox { background: $background; color: $text; border: 1px solid $border;
                   border-radius: 3px; padding: 9px 12px; font-size: 32px; font-weight: 600; }
 QDoubleSpinBox:focus { border-color: $accent; }
@@ -176,6 +194,177 @@ class ProcessError(RuntimeError):
     """A child process did not complete."""
 
 
+def version_parts(value: str) -> tuple[tuple[int, int, int], bool]:
+    """Read SemVer without treating numeric versions as decimal numbers."""
+    if not isinstance(value, str) or len(value) > 128:
+        raise ValueError("Invalid app version.")
+    match = re.fullmatch(
+        r"v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+        r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+        r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",
+        value,
+    )
+    if not match:
+        raise ValueError("Invalid app version.")
+    prerelease = match.group(4)
+    if prerelease and any(
+        part.isdigit() and len(part) > 1 and part.startswith("0")
+        for part in prerelease.split(".")
+    ):
+        raise ValueError("Invalid app version.")
+    return tuple(int(match.group(index)) for index in (1, 2, 3)), bool(prerelease)
+
+
+def get_app_version() -> str:
+    root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    try:
+        value = (root / "VERSION").read_text(encoding="utf-8").strip()
+    except OSError:
+        # main.py also works alone during development. Releases include VERSION.
+        if getattr(sys, "frozen", False):
+            raise RuntimeError("The app version is missing. Reinstall the app.")
+        value = "0.0.1"
+    version_parts(value)
+    return value.removeprefix("v")
+
+
+@dataclass(frozen=True)
+class ReleaseInfo:
+    version: str
+    url: str
+    newer: bool
+
+
+def parse_release(payload: bytes, current_version: str) -> ReleaseInfo:
+    if len(payload) > MAX_UPDATE_BYTES:
+        raise ValueError("Update information is too large.")
+    data = json.loads(payload)
+    if (
+        not isinstance(data, dict)
+        or data.get("draft") is not False
+        or data.get("prerelease") is not False
+    ):
+        raise ValueError("A published release is required.")
+    tag = data.get("tag_name")
+    latest, prerelease = version_parts(tag)
+    if prerelease:
+        raise ValueError("A stable release is required.")
+    installed, installed_prerelease = version_parts(current_version)
+    # Build the link from a validated tag. Never open an API-supplied URL.
+    release_url = (
+        PROJECT_URL
+        + "/releases/tag/"
+        + bytes(QUrl.toPercentEncoding(tag)).decode("ascii")
+    )
+    return ReleaseInfo(
+        tag.removeprefix("v"),
+        release_url,
+        latest > installed or (latest == installed and installed_prerelease),
+    )
+
+
+class UpdateChecker(QObject):
+    """Use Qt's asynchronous HTTPS client and the platform's trusted certificates."""
+
+    checked = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    busy_changed = pyqtSignal(bool)
+
+    def __init__(self, version: str, parent=None):
+        super().__init__(parent)
+        self.version = version
+        self.manager = QNetworkAccessManager(self)
+        self.reply: QNetworkReply | None = None
+        self.buffer = bytearray()
+        self.failure = ""
+        self.cancelled = False
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self.timed_out)
+
+    def check(self):
+        if self.reply is not None:
+            return
+        self.buffer.clear()
+        self.failure = ""
+        self.cancelled = False
+        request = QNetworkRequest(QUrl(UPDATE_API_URL))
+        request.setRawHeader(b"Accept", b"application/vnd.github+json")
+        request.setRawHeader(
+            b"User-Agent", f"DiscordVideoCompressor/{self.version}".encode("ascii")
+        )
+        request.setTransferTimeout(UPDATE_TIMEOUT_MS)
+        request.setAttribute(
+            QNetworkRequest.Attribute.RedirectPolicyAttribute,
+            QNetworkRequest.RedirectPolicy.SameOriginRedirectPolicy,
+        )
+        self.reply = self.manager.get(request)
+        self.reply.setReadBufferSize(MAX_UPDATE_BYTES + 1)
+        self.reply.readyRead.connect(self.read_reply)
+        self.reply.finished.connect(self.finished)
+        self.timer.start(UPDATE_TIMEOUT_MS)
+        self.busy_changed.emit(True)
+
+    def read_reply(self):
+        if (
+            self.reply is not None
+            and self.reply.isOpen()
+            and self.reply.bytesAvailable() > 0
+        ):
+            chunk = self.reply.read(MAX_UPDATE_BYTES + 1 - len(self.buffer))
+            if chunk:
+                self.buffer.extend(chunk)
+            if len(self.buffer) > MAX_UPDATE_BYTES:
+                self.failure = (
+                    "The update information could not be read. Try again later."
+                )
+                self.reply.abort()
+
+    def timed_out(self):
+        if self.reply is not None:
+            self.failure = "The update check timed out. Try again later."
+            self.reply.abort()
+
+    def cancel(self):
+        self.cancelled = True
+        self.timer.stop()
+        if self.reply is not None:
+            self.reply.abort()
+
+    def finished(self):
+        self.timer.stop()
+        self.read_reply()
+        reply = self.reply
+        if reply is None:
+            return
+        self.reply = None
+        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        error = reply.error()
+        reply.deleteLater()
+        self.busy_changed.emit(False)
+        if self.cancelled:
+            return
+        if self.failure:
+            self.failed.emit(self.failure)
+        elif status in (403, 429):
+            self.failed.emit(
+                "GitHub is busy. Try again later, or open the downloads page."
+            )
+        elif status == 404:
+            self.failed.emit("No release is available yet. Try again later.")
+        elif error != QNetworkReply.NetworkError.NoError or status != 200:
+            self.failed.emit("Check your internet connection and try again.")
+        else:
+            try:
+                release = parse_release(bytes(self.buffer), self.version)
+            except (ValueError, TypeError, UnicodeError, RecursionError):
+                self.failed.emit(
+                    "The update information could not be read. Try again later."
+                )
+            else:
+                self.checked.emit(release)
+
+
 def get_app_icon() -> QIcon:
     root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     return QIcon(str(root / "assets" / "app.png"))
@@ -187,6 +376,7 @@ def create_application(arguments: list[str]) -> QApplication:
     QApplication.setApplicationDisplayName(APP_NAME)
     app = QApplication(arguments)
     app.setDesktopFileName(APP_ID)
+    app.setApplicationVersion(get_app_version())
     app.setWindowIcon(get_app_icon())
     return app
 
@@ -1241,6 +1431,11 @@ class MainWindow(QMainWindow):
     def __init__(self, settings: QSettings | None = None):
         super().__init__()
         self.setWindowTitle(APP_NAME)
+        self.version = get_app_version()
+        self.updates = UpdateChecker(self.version, self)
+        self.updates.checked.connect(self.show_update_result)
+        self.updates.failed.connect(self.show_update_error)
+        self.updates.busy_changed.connect(self.update_check_state)
         self.resize(1060, 740)
         self.setMinimumSize(900, 680)
         self.settings = (
@@ -1294,6 +1489,23 @@ class MainWindow(QMainWindow):
         theme_row.addWidget(self.theme_switch)
         theme_row.addWidget(ui_label("Dark"))
         header.addLayout(theme_row)
+        self.about_action = QAction("About Discord Video Compressor", self)
+        self.about_action.setMenuRole(QAction.MenuRole.AboutRole)
+        self.about_action.triggered.connect(self.show_about)
+        self.update_action = QAction("Check for updates…", self)
+        self.update_action.setMenuRole(QAction.MenuRole.ApplicationSpecificRole)
+        self.update_action.triggered.connect(self.updates.check)
+        if sys.platform == "darwin" and QApplication.platformName() == "cocoa":
+            native_help = self.menuBar().addMenu("Help")
+            native_help.addActions([self.about_action, self.update_action])
+        self.about_button = QPushButton("About")
+        self.about_button.setObjectName("headerAction")
+        self.about_button.clicked.connect(self.about_action.trigger)
+        header.addWidget(self.about_button)
+        self.update_button = QPushButton("Check for updates")
+        self.update_button.setObjectName("headerAction")
+        self.update_button.clicked.connect(self.update_action.trigger)
+        header.addWidget(self.update_button)
         layout.addLayout(header)
 
         workspace = QHBoxLayout()
@@ -1422,6 +1634,77 @@ class MainWindow(QMainWindow):
         worker = DetectionWorker(self)
         worker.detected.connect(self.set_hardware)
         self.launch(worker)
+
+    def show_about(self):
+        box = QMessageBox(self)
+        box.setWindowTitle(f"About {APP_NAME}")
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setIconPixmap(get_app_icon().pixmap(64, 64))
+        box.setText(APP_NAME)
+        box.setInformativeText(
+            f"Version {self.version}\n\n"
+            "Compress video clips to the file size you choose.\n"
+            "Your clips stay on your computer.\n\n"
+            f"{AFFILIATION_NOTICE}\n\nGPL-3.0 license"
+        )
+        website = box.addButton("Website", QMessageBox.ButtonRole.ActionRole)
+        license_button = box.addButton("License", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.exec()
+        if box.clickedButton() is website:
+            QDesktopServices.openUrl(QUrl(WEBSITE_URL))
+        elif box.clickedButton() is license_button:
+            QDesktopServices.openUrl(QUrl(PROJECT_URL + "/blob/main/LICENSE"))
+
+    def update_check_state(self, busy: bool):
+        self.update_action.setEnabled(not busy)
+        self.update_action.setText(
+            "Checking for updates…" if busy else "Check for updates…"
+        )
+        self.update_button.setEnabled(not busy)
+        self.update_button.setText(
+            "Checking for updates…" if busy else "Check for updates"
+        )
+
+    def show_update_result(self, release: ReleaseInfo):
+        if self._closing:
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Check for updates")
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(
+            f"Version {release.version} is available"
+            if release.newer
+            else "No update available"
+        )
+        box.setInformativeText(
+            f"Installed: {self.version}\nLatest release: {release.version}"
+        )
+        download = None
+        if release.newer:
+            download = box.addButton(
+                "Download update", QMessageBox.ButtonRole.AcceptRole
+            )
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.exec()
+        if download is not None and box.clickedButton() is download:
+            QDesktopServices.openUrl(QUrl(release.url))
+
+    def show_update_error(self, message: str):
+        if self._closing:
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Check for updates")
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText("Could not check for updates")
+        box.setInformativeText(message)
+        downloads = box.addButton("Open downloads", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.exec()
+        if box.clickedButton() is downloads:
+            QDesktopServices.openUrl(QUrl(RELEASES_URL))
 
     def change_theme(self, dark_mode: bool):
         self.theme_name = "ink" if dark_mode else "frost"
@@ -1672,8 +1955,9 @@ class MainWindow(QMainWindow):
             )
 
     def closeEvent(self, event: QCloseEvent):
+        self._closing = True
+        self.updates.cancel()
         if self.worker:
-            self._closing = True
             self.worker.cancel()
             self.status_label.setText("Stopping before closing…")
             event.ignore()
@@ -1689,6 +1973,8 @@ def self_test() -> int:
     assert not app.windowIcon().isNull(), "The app icon is missing."
     assert app.applicationName() == APP_NAME
     assert app.applicationDisplayName() == APP_NAME
+    assert app.applicationVersion() == get_app_version()
+    assert QSslSocket.supportsSsl(), "Qt's HTTPS support is missing."
     if sys.platform == "darwin" and getattr(sys, "frozen", False):
         import plistlib
 

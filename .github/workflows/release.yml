@@ -70,10 +70,8 @@ jobs:
           actual = platform.machine().lower().replace('amd64', 'x86_64').replace('aarch64', 'arm64')
           if actual != expected:
               raise SystemExit(f'Runner architecture is {actual}; expected {expected}.')
-          # Info.plist uses the numeric release version, without a prerelease suffix.
-          version = re.match(r'v(\d+\.\d+\.\d+)', tag).group(1)
-          with Path(os.environ['GITHUB_ENV']).open('a', encoding='utf-8') as stream:
-              stream.write(f'APP_VERSION={version}\n')
+          # The app uses the full tag on every platform, including prereleases.
+          Path('VERSION').write_text(tag[1:] + '\n', encoding='utf-8')
           prerelease = '-' in tag.split('+', 1)[0]
           with Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as stream:
               stream.write(f'prerelease={str(prerelease).lower()}\n')

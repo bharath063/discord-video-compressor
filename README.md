@@ -28,8 +28,11 @@ app has no certificate signature. Your operating system may block the first laun
 4. Check the final file size and elapsed time. Select **Show in folder** to find the result.
 
 Use **Cancel** to stop compression. The **Light / Dark** switch changes the theme.
+Use **About** to see the app version. Use **Check for updates** to find a newer release.
 
 The output is an MP4 file. HEVC playback support depends on your device.
 
 [Report a problem](https://github.com/bharath063/discord-video-compressor/issues)
 · [GPL-3.0 license](LICENSE)
+
+This app is not affiliated with Discord.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
 import struct
@@ -17,6 +18,180 @@ import main
 from PyQt6.QtCore import QPoint
 from PyQt6.QtGui import QImage
 from PyQt6.QtTest import QTest
+
+
+class UpdateVersionTests(unittest.TestCase):
+    def release(self, tag, installed="0.0.1", **extra):
+        payload = {"tag_name": tag, "draft": False, "prerelease": False, **extra}
+        return main.parse_release(json.dumps(payload).encode(), installed)
+
+    def test_numeric_versions_prereleases_and_build_metadata(self):
+        for tag, installed, expected in (
+            ("v0.0.10", "0.0.9", True),
+            ("v0.0.9", "0.0.10", False),
+            ("v1.0.0", "1.0.0-rc.2", True),
+            ("v0.0.1+build.2", "0.0.1+build.1", False),
+            ("v0.0.1", "0.0.1", False),
+        ):
+            with self.subTest(tag=tag, installed=installed):
+                self.assertEqual(self.release(tag, installed).newer, expected)
+
+    def test_draft_prerelease_and_invalid_versions_are_rejected(self):
+        for tag, options in (
+            ("v1.0.0", {"draft": True}),
+            ("v1.0.0-rc.1", {"prerelease": True}),
+            ("v1.0.0-rc.1", {}),
+            ("v01.0.0", {}),
+            ("<b>1.0.0</b>", {}),
+            ("v1.0.0/../../other", {}),
+            (None, {}),
+        ):
+            with self.subTest(tag=tag), self.assertRaises(ValueError):
+                self.release(tag, **options)
+        with self.assertRaises(ValueError):
+            main.version_parts("1.0.0-rc.01")
+        for data in (b"[]", b"not JSON", b"x" * (main.MAX_UPDATE_BYTES + 1)):
+            with self.subTest(data=data[:20]), self.assertRaises(ValueError):
+                main.parse_release(data, "0.0.1")
+
+    def test_remote_download_urls_are_ignored(self):
+        release = self.release(
+            "v1.2.3+build.4", html_url="https://untrusted.example/installer"
+        )
+        self.assertEqual(
+            release.url, main.PROJECT_URL + "/releases/tag/v1.2.3%2Bbuild.4"
+        )
+
+    def test_packaged_version_has_priority_over_source_version(self):
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "VERSION").write_text("1.2.3-rc.2\n")
+            with patch.object(main.sys, "_MEIPASS", folder, create=True):
+                self.assertEqual(main.get_app_version(), "1.2.3-rc.2")
+            (Path(folder) / "VERSION").unlink()
+            with (
+                patch.object(main.sys, "_MEIPASS", folder, create=True),
+                patch.object(main.sys, "frozen", True, create=True),
+                self.assertRaisesRegex(RuntimeError, "version is missing"),
+            ):
+                main.get_app_version()
+
+
+class UpdateNetworkTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        cls.app = main.QApplication.instance() or main.QApplication([])
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                cls.requests += 1
+                time.sleep(cls.delay)
+                self.send_response(cls.status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(cls.body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(cls.body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.server_thread = threading.Thread(
+            target=lambda: cls.server.serve_forever(poll_interval=0.01), daemon=True
+        )
+        cls.server_thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.server_thread.join(timeout=1)
+
+    def setUp(self):
+        cls = type(self)
+        cls.requests, cls.delay, cls.status = 0, 0, 200
+        cls.body = json.dumps(
+            {"tag_name": "v0.0.2", "draft": False, "prerelease": False}
+        ).encode()
+        self.api_patch = patch(
+            "main.UPDATE_API_URL", f"http://127.0.0.1:{self.server.server_port}/latest"
+        )
+        self.api_patch.start()
+        self.checker = main.UpdateChecker("0.0.1")
+        self.results, self.errors, self.busy = [], [], []
+        self.checker.checked.connect(self.results.append)
+        self.checker.failed.connect(self.errors.append)
+        self.checker.busy_changed.connect(self.busy.append)
+
+    def tearDown(self):
+        self.checker.cancel()
+        self.wait_done()
+        self.checker.deleteLater()
+        self.app.processEvents()
+        self.api_patch.stop()
+
+    def wait_done(self):
+        deadline = time.monotonic() + 3
+        while self.checker.reply is not None and time.monotonic() < deadline:
+            QTest.qWait(10)
+        self.assertIsNone(self.checker.reply, "Update request did not finish")
+
+    def test_check_is_async_keeps_timers_running_and_prevents_duplicate_requests(self):
+        type(self).delay = 0.15
+        ticks = []
+        timer = main.QTimer()
+        timer.timeout.connect(lambda: ticks.append(1))
+        timer.start(10)
+        self.checker.check()
+        self.checker.check()
+        self.assertEqual(self.busy, [True])
+        self.wait_done()
+        timer.stop()
+        self.assertGreater(len(ticks), 2)
+        self.assertEqual(type(self).requests, 1)
+        self.assertEqual(self.busy, [True, False])
+        self.assertFalse(self.errors)
+        self.assertTrue(self.results[0].newer)
+
+    def test_rate_limit_invalid_json_and_large_responses_report_errors(self):
+        for status, body, expected in (
+            (403, b"{}", "GitHub is busy"),
+            (200, b"not JSON", "could not be read"),
+            (200, b"x" * (main.MAX_UPDATE_BYTES + 1), "could not be read"),
+        ):
+            with self.subTest(status=status, bytes=len(body)):
+                type(self).status, type(self).body = status, body
+                self.errors.clear()
+                self.checker.check()
+                self.wait_done()
+                self.assertEqual(len(self.errors), 1)
+                self.assertIn(expected, self.errors[0])
+                self.assertFalse(self.results)
+
+    def test_timeout_resets_state_and_a_later_check_can_succeed(self):
+        type(self).delay = 0.2
+        with patch("main.UPDATE_TIMEOUT_MS", 40):
+            self.checker.check()
+            self.wait_done()
+        self.assertTrue(self.errors)
+        self.assertEqual(self.busy[-1], False)
+        type(self).delay = 0
+        self.checker.check()
+        self.wait_done()
+        self.assertTrue(self.results)
+
+    def test_cancel_does_not_emit_a_user_error(self):
+        type(self).delay = 0.15
+        self.checker.check()
+        QTest.qWait(20)
+        self.checker.cancel()
+        self.wait_done()
+        self.assertFalse(self.results)
+        self.assertFalse(self.errors)
+        self.assertEqual(self.busy, [True, False])
 
 
 class BitrateTests(unittest.TestCase):
@@ -480,6 +655,72 @@ class SizeSettingTests(unittest.TestCase):
         self.window.deleteLater()
         self.app.processEvents()
         self.folder.cleanup()
+
+    def test_about_button_shows_version_and_disclaimer(self):
+        boxes = []
+        with patch.object(main.QMessageBox, "exec", lambda box: boxes.append(box) or 0):
+            self.window.about_button.click()
+        self.assertEqual(len(boxes), 1)
+        self.assertIn(f"Version {main.get_app_version()}", boxes[0].informativeText())
+        self.assertIn(main.AFFILIATION_NOTICE, boxes[0].informativeText())
+        self.assertEqual(boxes[0].textFormat(), main.Qt.TextFormat.PlainText)
+        self.assertEqual(
+            self.window.about_action.menuRole(), main.QAction.MenuRole.AboutRole
+        )
+
+    def test_mac_app_menu_and_header_buttons_use_the_same_actions(self):
+        with (
+            patch.object(main.sys, "platform", "darwin"),
+            patch.object(main.QApplication, "platformName", return_value="cocoa"),
+            patch.object(main.DetectionWorker, "start"),
+            patch.object(main.UpdateChecker, "check") as check,
+        ):
+            window = main.MainWindow(self.settings)
+            window.job_finished()
+            native_menu = window.menuBar().actions()[0].menu()
+            self.assertEqual(
+                native_menu.actions(), [window.about_action, window.update_action]
+            )
+            window.show()
+            self.app.processEvents()
+            QTest.mouseClick(window.update_button, main.Qt.MouseButton.LeftButton)
+            check.assert_called_once()
+            boxes = []
+            with patch.object(
+                main.QMessageBox, "exec", lambda box: boxes.append(box) or 0
+            ):
+                window.about_action.trigger()
+                QTest.mouseClick(window.about_button, main.Qt.MouseButton.LeftButton)
+            self.assertEqual(len(boxes), 2)
+            window.update_check_state(True)
+            self.assertFalse(window.update_button.isEnabled())
+            self.assertFalse(window.update_action.isEnabled())
+            window.update_check_state(False)
+            self.assertTrue(window.update_button.isEnabled())
+            self.assertTrue(window.update_action.isEnabled())
+            window.close()
+            window.deleteLater()
+
+    def test_update_results_do_not_change_compression_progress(self):
+        self.window._started_at = time.monotonic()
+        self.window.elapsed_timer.start()
+        self.window.progress.setValue(42)
+        boxes = []
+        with patch.object(main.QMessageBox, "exec", lambda box: boxes.append(box) or 0):
+            self.window.show_update_error(
+                "Check your internet connection and try again."
+            )
+            self.window.show_update_result(
+                main.ReleaseInfo("0.0.2", main.RELEASES_URL, True)
+            )
+        self.assertEqual(len(boxes), 2)
+        self.assertTrue(self.window.elapsed_timer.isActive())
+        self.assertEqual(self.window.progress.value(), 42)
+        self.window.update_check_state(True)
+        self.assertFalse(self.window.update_action.isEnabled())
+        self.assertTrue(self.window.about_action.isEnabled())
+        self.window.update_check_state(False)
+        self.assertTrue(self.window.update_action.isEnabled())
 
     def test_old_default_is_moved_to_the_new_preset(self):
         self.settings.remove("default_target_mb")

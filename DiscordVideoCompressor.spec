@@ -5,6 +5,8 @@ import sys
 from PyInstaller.utils.hooks import copy_metadata
 
 project = Path(SPECPATH)
+release_version = (project / "VERSION").read_text(encoding="utf-8").strip()
+bundle_version = release_version.split("-", 1)[0].split("+", 1)[0]
 suffix = ".exe" if sys.platform == "win32" else ""
 binaries = []
 for name in ("ffmpeg", "ffprobe"):
@@ -23,7 +25,7 @@ for source in icon_files.values():
         )
 datas = [
     (str(project / name), ".")
-    for name in ("README.md", "THIRD_PARTY_NOTICES.md", "LICENSE")
+    for name in ("README.md", "THIRD_PARTY_NOTICES.md", "LICENSE", "VERSION")
 ]
 datas.append((str(icon_files["app.png"]), "assets"))
 for package in ("PyQt6", "PyQt6-Qt6", "PyQt6-sip"):
@@ -84,7 +86,7 @@ if sys.platform == "darwin":
         name="DiscordVideoCompressor.app",
         icon=str(icon_files["app.icns"]),
         bundle_identifier="io.github.discord-video-compressor",
-        version=os.environ.get("APP_VERSION", "0.1.0"),
+        version=bundle_version,
         info_plist={
             "CFBundleName": "Discord Video Compressor",
             "CFBundleDisplayName": "Discord Video Compressor",
