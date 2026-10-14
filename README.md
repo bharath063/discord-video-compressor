@@ -5,7 +5,7 @@ Compress video clips to a file size you choose. The default is **19.5 MB**, belo
 Your clips stay on your computer, and your original files are kept.
 
 **[Download the app](https://github.com/bharath063/discord-video-compressor/releases/latest)**
-· [Website](https://www.bharathbalan.com/discord-video-compressor/)
+· [Website](https://bharath063.github.io/discord-video-compressor/)
 
 ## Install
 
