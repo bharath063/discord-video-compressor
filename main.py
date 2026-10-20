@@ -88,9 +88,10 @@ WINDOWS_ACCESS_HELP = (
     "2. Select Manage ransomware protection.\n"
     "3. Select Allow an app through Controlled folder access.\n"
     "4. Select Add an allowed app > Recently blocked apps.\n"
-    "5. Allow the program named in the blocked access notice. It may be "
-    "DiscordVideoCompressor.exe, ffmpeg.exe, or ffprobe.exe.\n\n"
-    "Restart the app, then try again. You can also choose another folder."
+    "5. Allow the exact program path shown in the notice. To save a video, "
+    "allow DiscordVideoCompressor.exe.\n\n"
+    "Keep the app in the same folder when updating so the approval still applies. "
+    "Restart the app after allowing it. You can also choose another output folder."
 )
 _DLL_DIRECTORY_LOCK = threading.Lock()
 UPDATE_TIMEOUT_MS = 15_000
@@ -1098,8 +1099,8 @@ class CompressionWorker(ProcessThread):
         with file_operation(
             "write to the output folder", self.output.parent, sys.executable
         ):
-            # The app saves the final file in this folder. FFmpeg writes in the
-            # private work folder below. Check the actual location for each.
+            # Only the app needs write access to the selected output folder.
+            # Helpers work in a private system temporary folder instead.
             with tempfile.TemporaryFile(
                 mode="w+b",
                 prefix=".discord-access-",
@@ -1115,7 +1116,7 @@ class CompressionWorker(ProcessThread):
                     raise OSError("The test file could not be read back.")
 
         tool_test = workdir / "ffmpeg-access-check.mp4"
-        with file_operation("write to the output folder", workdir, ffmpeg):
+        with file_operation("write to the temporary work folder", workdir, ffmpeg):
             # Defender grants access per executable. A Python write alone does
             # not prove that the bundled ffmpeg.exe can write in this folder.
             self.run_process(
@@ -1144,7 +1145,7 @@ class CompressionWorker(ProcessThread):
         with file_operation("read the output test file", tool_test, sys.executable):
             if tool_test.stat().st_size == 0:
                 raise OSError("FFmpeg created an empty test file.")
-        with file_operation("read from the output folder", workdir, ffprobe):
+        with file_operation("read from the temporary work folder", workdir, ffprobe):
             self.run_process(
                 [
                     ffprobe,
@@ -1174,10 +1175,12 @@ class CompressionWorker(ProcessThread):
         hardware = self.hardware
         gpu_decode = hardware.encoder == "hevc_nvenc"
         bitrate = calculate_video_bitrate(info, hardware, self.target_mb)
-        with file_operation("create a work folder", self.output.parent, sys.executable):
-            temporary = tempfile.TemporaryDirectory(
-                prefix=".discord-compressor-", dir=self.output.parent
-            )
+        with file_operation(
+            "create a temporary work folder", Path(tempfile.gettempdir()), sys.executable
+        ):
+            # Avoid requiring FFmpeg to modify a protected Documents/Videos
+            # folder. Only the verified result is copied there by this app.
+            temporary = tempfile.TemporaryDirectory(prefix="discord-compressor-")
         with temporary as folder:
             workdir = Path(folder)
             self.check_file_access(ffmpeg, ffprobe, workdir, info)

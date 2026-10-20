@@ -574,7 +574,7 @@ class FileAccessTests(unittest.TestCase):
             self.worker.compress()
         self.assertEqual(process.call_count, 2)
         self.assertEqual(caught.exception.program, "ffmpeg.exe")
-        self.assertEqual(caught.exception.operation, "write to the output folder")
+        self.assertEqual(caught.exception.operation, "write to the temporary work folder")
         self.assertTrue(caught.exception.denied)
         self.assertEqual(changes, [])
         self.assertEqual(statuses, ["Checking file access…"])
@@ -583,7 +583,7 @@ class FileAccessTests(unittest.TestCase):
             [p.name for p in Path(self.folder.name).iterdir()], [self.source.name]
         )
 
-    def test_ffprobe_must_read_output_folder_too(self):
+    def test_ffprobe_must_read_temporary_work_folder_too(self):
         def run_tool(command, **kwargs):
             if command[0] == "ffprobe.exe":
                 raise main.ProcessError("Permission denied")
@@ -597,7 +597,7 @@ class FileAccessTests(unittest.TestCase):
         ):
             self.worker.compress()
         self.assertEqual(caught.exception.program, "ffprobe.exe")
-        self.assertEqual(caught.exception.operation, "read from the output folder")
+        self.assertEqual(caught.exception.operation, "read from the temporary work folder")
         self.assertTrue(caught.exception.denied)
         self.assertFalse(self.output.exists())
 
@@ -614,6 +614,50 @@ class FileAccessTests(unittest.TestCase):
         self.assertEqual(process.call_count, 3)
         self.assertEqual(self.source.read_bytes(), b"original video")
         self.assertFalse(self.output.exists())
+
+    def test_helpers_never_write_into_the_selected_output_folder(self):
+        workdirs = []
+
+        def run_tool(command, **kwargs):
+            if "lavfi" in command or command[-1].endswith("encoded.mp4"):
+                destination = Path(command[-1]).resolve()
+                if destination.is_relative_to(self.output.parent):
+                    raise main.ProcessError("Error opening output file: Permission denied")
+                self.assertEqual(
+                    destination.parent.parent, Path(tempfile.gettempdir()).resolve()
+                )
+                workdirs.append(destination.parent)
+                destination.write_bytes(b"encoded video")
+            return ""
+
+        with (
+            patch("main.get_ffmpeg_path", side_effect=lambda name: name + ".exe"),
+            patch.object(self.worker, "probe", return_value=self.info),
+            patch.object(self.worker, "run_process", side_effect=run_tool),
+        ):
+            path, size = self.worker.compress()
+        self.assertEqual(path, self.output)
+        self.assertEqual(size, len(b"encoded video"))
+        self.assertEqual(self.output.read_bytes(), b"encoded video")
+        self.assertEqual(self.source.read_bytes(), b"original video")
+        self.assertEqual(len(workdirs), 2)
+        self.assertTrue(all(not folder.exists() for folder in workdirs))
+
+    def test_failed_temp_directory_creation_names_the_temporary_folder(self):
+        with (
+            patch("main.get_ffmpeg_path", return_value="ffmpeg.exe"),
+            patch.object(self.worker, "probe", return_value=self.info),
+            patch(
+                "main.tempfile.TemporaryDirectory",
+                side_effect=PermissionError(13, "Permission denied"),
+            ),
+            self.assertRaises(main.FileOperationError) as caught,
+        ):
+            self.worker.compress()
+        self.assertEqual(caught.exception.program, sys.executable)
+        self.assertEqual(caught.exception.path, Path(tempfile.gettempdir()))
+        self.assertEqual(caught.exception.operation, "create a temporary work folder")
+        self.assertTrue(caught.exception.denied)
 
     def test_cancelled_access_check_leaves_no_test_file(self):
         def cancel_read(command, **kwargs):
@@ -910,9 +954,12 @@ class OutputTests(unittest.TestCase):
                 source, output, main.Hardware("hevc_nvenc", "NVIDIA")
             )
             info = main.MediaInfo(30, False, 0, 640, 360)
+            workdirs = []
 
             def fake_encode(command, **kwargs):
-                Path(command[-1]).write_bytes(b"partial output")
+                encoded = Path(command[-1])
+                workdirs.append(encoded.parent)
+                encoded.write_bytes(b"partial output")
                 worker.cancel()
                 raise main.Cancelled()
 
@@ -925,6 +972,8 @@ class OutputTests(unittest.TestCase):
                     worker.compress()
             self.assertFalse(output.exists())
             self.assertEqual([p.name for p in Path(folder).iterdir()], ["input.mp4"])
+            self.assertTrue(workdirs)
+            self.assertTrue(all(not workdir.exists() for workdir in workdirs))
 
     def test_larger_selected_limit_is_used_when_saving(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -1053,7 +1102,7 @@ class SizeSettingTests(unittest.TestCase):
             self.window.show_error("[WinError 5] Access is denied")
         self.assertEqual(boxes[0].text(), "File access blocked")
         self.assertIn("Recently blocked apps", boxes[0].informativeText())
-        self.assertIn("ffmpeg.exe", boxes[0].informativeText())
+        self.assertIn("DiscordVideoCompressor.exe", boxes[0].informativeText())
         self.assertEqual(boxes[0].textFormat(), main.Qt.TextFormat.PlainText)
         self.assertEqual(
             open_security.call_args.args[0].toString(), main.WINDOWS_SECURITY_URL

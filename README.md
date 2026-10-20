@@ -34,13 +34,23 @@ The output is an MP4 file. HEVC playback support depends on your device.
 
 ## Windows file access
 
-If Windows Security blocks the app, open **Virus & threat protection → Manage
+Windows protects folders such as Documents and Videos with Controlled folder
+access. If saving there is blocked, open **Virus & threat protection → Manage
 ransomware protection → Allow an app through Controlled folder access → Add an
-allowed app → Recently blocked apps**. Allow the program named in the notice:
-`DiscordVideoCompressor.exe`, `ffmpeg.exe`, or `ffprobe.exe`. Restart the app and retry.
+allowed app → Recently blocked apps** and allow `DiscordVideoCompressor.exe`.
+Restart the app and retry.
 
-Keep the app folder in one location so these approvals stay valid. You can also
-choose another input or output folder. [Microsoft's instructions](https://support.microsoft.com/en-us/windows/security/threat-malware-protection/virus-and-threat-protection-in-the-windows-security-app).
+The approval applies to the executable's full path. Keep the app in one fixed
+folder and replace its contents when updating; opening each build in a different
+folder requires another approval. For local builds, keep launching
+`dist\DiscordVideoCompressor\DiscordVideoCompressor.exe`.
+[Microsoft's instructions](https://learn.microsoft.com/en-us/defender-endpoint/controlled-folder-access-overview#allow-apps-to-modify-files-in-protected-folders).
+
+Compression and previews use private folders in the system temporary directory,
+which are removed when the job finishes, fails, or is cancelled. FFmpeg and
+FFprobe do not write into your selected output folder; the app copies only the
+verified video there. If you prefer to save without changing Windows Security
+settings, select a folder outside the protected locations.
 
 The app checks file access before compression. An access error shows the program
 and folder that failed. Select **Copy error** if you need to report it.
